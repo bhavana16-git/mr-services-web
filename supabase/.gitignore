@@ -6,3 +6,10 @@
 .env.keys
 .env.local
 .env.*.local
+
+# Edge Function secrets (real API keys) - never commit
+.env.*
+!.env.example
+
+
+

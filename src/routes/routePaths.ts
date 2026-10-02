@@ -1,0 +1,41 @@
+export const ROUTES = {
+  home: "/",
+  about: "/about",
+  services: "/services",
+  whyChooseUs: "/why-choose-us",
+  faq: "/faq",
+  blog: "/blog",
+  blogPost: (slug: string) => `/blog/${slug}`,
+  contact: "/contact",
+  terms: "/terms",
+  privacy: "/privacy",
+  signUp: "/sign-up",
+  signIn: "/sign-in",
+  forgotPassword: "/forgot-password",
+  resetPassword: "/reset-password",
+
+  portalDashboard: "/portal/dashboard",
+  portalPackages: "/portal/packages",
+  portalRequests: "/portal/requests",
+  portalNewRequest: "/portal/requests/new",
+  portalRequestDetail: (id: string) => `/portal/requests/${id}`,
+  portalDocuments: "/portal/documents",
+  portalMessages: "/portal/messages",
+  portalProfile: "/portal/profile",
+
+  adminDashboard: "/admin/dashboard",
+  adminContactSubmissions: "/admin/contact-submissions",
+  adminClients: "/admin/clients",
+  adminClientDetail: (id: string) => `/admin/clients/${id}`,
+  adminRequests: "/admin/requests",
+  adminRequestDetail: (id: string) => `/admin/requests/${id}`,
+  adminDocuments: "/admin/documents",
+  adminMessages: "/admin/messages",
+  adminPackages: "/admin/packages",
+  adminBlog: "/admin/blog",
+  adminTestimonials: "/admin/testimonials",
+  adminSettings: "/admin/settings",
+} as const;
+
+
+

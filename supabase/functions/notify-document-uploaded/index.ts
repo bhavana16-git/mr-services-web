@@ -1,9 +1,7 @@
 // supabase/functions/notify-document-uploaded/index.ts
 //
-// Notifies a client, per their notification_preference, when admin
-// uploads a new document to their account (api-spec.md 4.4, 3.4).
-// Same WhatsApp limitation as notify-new-message applies here.
-
+// Emails a client, if their notification_preference allows it, when admin uploads a
+// document to their account. WhatsApp is not sent automatically.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -12,6 +10,10 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
+
+// The optional secret FROM_EMAIL changes the sender address without editing code.
+const FROM_ADDRESS =
+  Deno.env.get("FROM_EMAIL") ?? "M. R. Services Website <notifications@mrservicesindia.com>";
 
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -24,6 +26,13 @@ function errorResponse(code: string, message: string, status: number) {
   return jsonResponse({ error: { code, message } }, status);
 }
 
+function escapeHtml(text: string) {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
@@ -48,75 +57,71 @@ Deno.serve(async (req: Request) => {
     return errorResponse("validation_error", "documentId is required.", 422);
   }
 
-
-
-    // Scoped to the caller's JWT. In practice this is always admin (only
-  // documents_admin_all permits the insert this function follows), and
-  // documents_admin_all also permits this select -- a client calling this
-  // directly would get zero rows back and a clean 404, never another
-  // client's document.
   const supabaseScoped = createClient(
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_ANON_KEY")!,
     { global: { headers: { Authorization: authHeader } } },
   );
 
+  // "profiles!client_id" says which of the two links to profiles to follow (the client's).
   const { data: document, error: documentError } = await supabaseScoped
     .from("documents")
-    .select("id, title, category, client_id, profiles(full_name, email, notification_preference)")
+    .select("id, title, category, client_id, profiles!client_id(full_name, email, notification_preference)")
     .eq("id", payload.documentId)
     .single();
 
   if (documentError || !document) {
+    console.error("Could not load the document:", documentError);
     return errorResponse("not_found", "Document not found or not accessible.", 404);
   }
 
+  const resendApiKey = Deno.env.get("RESEND_API_KEY");
+  if (!resendApiKey) {
+    console.error("The RESEND_API_KEY secret is not set. No email was sent.");
+    return jsonResponse({ success: true });
+  }
 
-
-
-    const resendApiKey = Deno.env.get("RESEND_API_KEY");
-  const preference = document.profiles.notification_preference as "email" | "whatsapp" | "both";
+  const client = document.profiles;
+  const preference = client.notification_preference as "email" | "whatsapp" | "both";
   const wantsEmail = preference === "email" || preference === "both";
   const wantsWhatsapp = preference === "whatsapp" || preference === "both";
 
-  if (wantsEmail && resendApiKey) {
+  if (wantsEmail) {
     try {
-      await fetch("https://api.resend.com/emails", {
+      const response = await fetch("https://api.resend.com/emails", {
         method: "POST",
         headers: {
           Authorization: `Bearer ${resendApiKey}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          from: "M. R. Services Website <notifications@mrservicesindia.com>",
-          to: [document.profiles.email],
+          from: FROM_ADDRESS,
+          to: [client.email],
           subject: "A new document is available in your Client Portal",
           html: `
-            <p>Hi ${document.profiles.full_name},</p>
-            <p>A new document, "<strong>${document.title}</strong>" (${document.category}),
-               has been added to your account. Sign in to the Client Portal to view or download it.</p>
+            <p>Hi ${escapeHtml(client.full_name)},</p>
+            <p>A new document, "<strong>${escapeHtml(document.title)}</strong>"
+               (${escapeHtml(String(document.category).replace(/_/g, " "))}), has been added to your account.
+               Sign in to the Client Portal to view or download it.</p>
           `,
         }),
       });
+      if (response.ok) {
+        console.log(`Email sent to ${client.email}`);
+      } else {
+        console.error("Resend rejected the email:", response.status, await response.text());
+      }
     } catch (emailError) {
-      console.error("Resend notification failed (document was still saved)", emailError);
+      console.error("Sending the email failed (the document was still saved):", emailError);
     }
   }
 
-
-
-
-    if (wantsWhatsapp) {
+  if (wantsWhatsapp) {
     console.log(
-      `notification_preference includes WhatsApp for client ${document.client_id}, ` +
-        `but no WhatsApp send capability exists in this stack (tech-stack.md 5). ` +
-        `No automated WhatsApp message was sent.`,
+      `Client ${document.client_id} prefers WhatsApp, but this project cannot send WhatsApp messages automatically.`,
     );
   }
 
   return jsonResponse({ success: true });
 });
-
-
-
 

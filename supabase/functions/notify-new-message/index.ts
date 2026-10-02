@@ -1,16 +1,9 @@
 // supabase/functions/notify-new-message/index.ts
 //
-// Notifies the *other* side of a conversation when a new message arrives
-// (api-spec.md 4.3). If a client sent the message, Manali is always
-// emailed (mirrors notify-new-request). If admin sent it, the client is
-// notified according to their own `notification_preference`.
-//
-// WhatsApp note: tech-stack.md 5 scopes WhatsApp integration to a
-// click-to-chat `wa.me` link only -- there is no WhatsApp Business API in
-// this stack, so this function cannot actually *send* a WhatsApp message.
-// Where a client's preference is 'whatsapp' or 'both', the email half (if
-// applicable) still goes out, and the WhatsApp half is a deliberate no-op,
-// documented inline below rather than silently pretending to send one.
+// Notifies the other side of a conversation when a new message arrives.
+//  - A client wrote the message: Manali is always emailed.
+//  - Admin wrote the message: the client is emailed if their notification_preference allows it.
+// WhatsApp messages are not sent automatically (this project only uses wa.me click-to-chat links).
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -19,6 +12,10 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
+
+// The optional secret FROM_EMAIL changes the sender address without editing code.
+const FROM_ADDRESS =
+  Deno.env.get("FROM_EMAIL") ?? "M. R. Services Website <notifications@mrservicesindia.com>";
 
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -31,24 +28,30 @@ function errorResponse(code: string, message: string, status: number) {
   return jsonResponse({ error: { code, message } }, status);
 }
 
+// Stops text typed by a user from being treated as HTML inside the email.
+function escapeHtml(text: string) {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
 
 async function sendEmail(resendApiKey: string, to: string, subject: string, html: string) {
-  await fetch("https://api.resend.com/emails", {
+  const response = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${resendApiKey}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      from: "M. R. Services Website <notifications@mrservicesindia.com>",
-      to: [to],
-      subject,
-      html,
-    }),
+    body: JSON.stringify({ from: FROM_ADDRESS, to: [to], subject, html }),
   });
+  if (response.ok) {
+    console.log(`Email sent to ${to}`);
+  } else {
+    console.error("Resend rejected the email:", response.status, await response.text());
+  }
 }
-
-
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
@@ -73,73 +76,74 @@ Deno.serve(async (req: Request) => {
     return errorResponse("validation_error", "messageId is required.", 422);
   }
 
-
-
-    // Scoped to the caller's JWT -- messages_select_own / messages_select_admin
-  // decide whether this caller may see the message at all.
+  // Runs as the signed-in caller, so the database rules decide what they may see.
   const supabaseScoped = createClient(
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_ANON_KEY")!,
     { global: { headers: { Authorization: authHeader } } },
   );
 
+  // "profiles!client_id" says which of the two links to profiles to follow (the client's).
   const { data: message, error: messageError } = await supabaseScoped
     .from("messages")
-    .select("id, client_id, sender_role, body, profiles(full_name, email, notification_preference)")
+    .select("id, client_id, sender_role, body, profiles!client_id(full_name, email, notification_preference)")
     .eq("id", payload.messageId)
     .single();
 
   if (messageError || !message) {
+    console.error("Could not load the message:", messageError);
     return errorResponse("not_found", "Message not found or not accessible.", 404);
   }
 
-
-    const resendApiKey = Deno.env.get("RESEND_API_KEY");
+  const resendApiKey = Deno.env.get("RESEND_API_KEY");
   const adminEmail = Deno.env.get("ADMIN_NOTIFICATION_EMAIL");
+  const client = message.profiles;
+
+  if (!resendApiKey) {
+    console.error("The RESEND_API_KEY secret is not set. No email was sent.");
+    return jsonResponse({ success: true });
+  }
 
   if (message.sender_role === "client") {
-    // Client -> admin: Manali is always emailed about a new client message.
-    if (resendApiKey && adminEmail) {
+    // Client -> admin: Manali is always emailed.
+    if (adminEmail) {
       try {
         await sendEmail(
           resendApiKey,
           adminEmail,
-          `New message from ${message.profiles.full_name}`,
-          `<p><strong>From:</strong> ${message.profiles.full_name} (${message.profiles.email})</p>
-           <p><strong>Message:</strong><br/>${message.body}</p>`,
+          `New message from ${client.full_name}`,
+          `<p><strong>From:</strong> ${escapeHtml(client.full_name)} (${escapeHtml(client.email)})</p>
+           <p><strong>Message:</strong><br/>${escapeHtml(message.body)}</p>`,
         );
       } catch (emailError) {
-        console.error("Resend notification to admin failed", emailError);
+        console.error("Sending the email to admin failed:", emailError);
       }
+    } else {
+      console.error("The ADMIN_NOTIFICATION_EMAIL secret is not set. No email was sent.");
     }
   } else {
-
-        // Admin -> client: respect the client's notification_preference.
-    const preference = message.profiles.notification_preference as "email" | "whatsapp" | "both";
+    // Admin -> client: respect the client's notification_preference.
+    const preference = client.notification_preference as "email" | "whatsapp" | "both";
     const wantsEmail = preference === "email" || preference === "both";
     const wantsWhatsapp = preference === "whatsapp" || preference === "both";
 
-    if (wantsEmail && resendApiKey) {
+    if (wantsEmail) {
       try {
         await sendEmail(
           resendApiKey,
-          message.profiles.email,
+          client.email,
           "You have a new message from M. R. Services",
-          `<p>Hi ${message.profiles.full_name},</p>
+          `<p>Hi ${escapeHtml(client.full_name)},</p>
            <p>You have a new message from M. R. Services. Sign in to the Client Portal to read and reply.</p>`,
         );
       } catch (emailError) {
-        console.error("Resend notification to client failed", emailError);
+        console.error("Sending the email to the client failed:", emailError);
       }
     }
 
     if (wantsWhatsapp) {
-      // Deliberate no-op: see the file header. Logged so this gap is
-      // visible in the Edge Function's own logs rather than silent.
       console.log(
-        `notification_preference includes WhatsApp for client ${message.client_id}, ` +
-          `but no WhatsApp send capability exists in this stack (tech-stack.md 5). ` +
-          `No automated WhatsApp message was sent.`,
+        `Client ${message.client_id} prefers WhatsApp, but this project cannot send WhatsApp messages automatically.`,
       );
     }
   }
