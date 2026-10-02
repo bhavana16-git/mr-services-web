@@ -77,7 +77,7 @@ export default function Home() {
       {/* Hero */}
       <section className="bg-primary-900 text-white">
         <Container className="py-20 text-center md:py-28">
-          <h1 className="font-heading text-4xl font-bold md:text-5xl">M. R. Services</h1>
+          <h1 className="font-heading text-4xl font-bold text-white md:text-5xl">M. R. Services</h1>
           <p className="mx-auto mt-4 max-w-2xl text-lg text-white/85 md:text-xl">
             Reliable Accounting &amp; Co-operative Society Management You Can Trust
           </p>
@@ -167,7 +167,7 @@ export default function Home() {
           <p className="mt-2 text-primary-900/80">
             Get in touch today for a free, no-obligation discussion.
           </p>
-          <Button asChild size="lg" className="mt-6 bg-primary-900 hover:bg-primary-900/90">
+          <Button asChild size="lg" className="mt-6 bg-primary-900 text-white hover:bg-primary-900/90">
             <Link to={ROUTES.contact}>Contact Us Now</Link>
           </Button>
         </Container>
@@ -175,4 +175,5 @@ export default function Home() {
     </>
   );
 }
+
 
