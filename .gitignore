@@ -40,3 +40,4 @@ supabase/.branches
 supabase/.temp
 
 
+*.tsbuildinfo
