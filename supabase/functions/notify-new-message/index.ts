@@ -15,7 +15,7 @@ const corsHeaders = {
 
 // The optional secret FROM_EMAIL changes the sender address without editing code.
 const FROM_ADDRESS =
-  Deno.env.get("FROM_EMAIL") ?? "M. R. Services Website <notifications@mrservicesindia.com>";
+  Deno.env.get("FROM_EMAIL") ?? "M. R. Services Website <onboarding@resend.dev>";
 
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {

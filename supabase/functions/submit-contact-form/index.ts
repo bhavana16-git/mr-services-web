@@ -161,7 +161,7 @@ Deno.serve(async (req: Request) => {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          from: "M. R. Services Website <notifications@mrservicesindia.com>",
+          from: "M. R. Services Website <onboarding@resend.dev>",
           to: [adminEmail],
           subject: `New contact form submission from ${payload.name}`,
           html: `
