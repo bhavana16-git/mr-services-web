@@ -2,6 +2,7 @@
 //
 // Emails Manali when a client submits a new request (api-spec.md 4.2).
 // Called by the frontend immediately after a successful `requests` insert.
+// Email sending now uses Brevo instead of Resend.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -20,6 +21,28 @@ function jsonResponse(body: unknown, status = 200) {
 
 function errorResponse(code: string, message: string, status: number) {
   return jsonResponse({ error: { code, message } }, status);
+}
+
+async function sendEmail(to: string, subject: string, html: string) {
+  const apiKey = Deno.env.get("BREVO_API_KEY");
+  const senderEmail = Deno.env.get("BREVO_SENDER_EMAIL");
+  const senderName = Deno.env.get("BREVO_SENDER_NAME") ?? "M. R. Services Website";
+  if (!apiKey || !senderEmail) return;
+
+  await fetch("https://api.brevo.com/v3/smtp/email", {
+    method: "POST",
+    headers: {
+      "api-key": apiKey,
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+    },
+    body: JSON.stringify({
+      sender: { name: senderName, email: senderEmail },
+      to: [{ email: to }],
+      subject,
+      htmlContent: html,
+    }),
+  });
 }
 
 Deno.serve(async (req: Request) => {
@@ -45,15 +68,13 @@ Deno.serve(async (req: Request) => {
     return errorResponse("validation_error", "requestId is required.", 422);
   }
 
-
-    const supabaseScoped = createClient(
+  const supabaseScoped = createClient(
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_ANON_KEY")!,
     { global: { headers: { Authorization: authHeader } } },
   );
 
-
-    const { data: request, error: requestError } = await supabaseScoped
+  const { data: request, error: requestError } = await supabaseScoped
     .from("requests")
     .select(
       "id, request_number, service_category, description, preferred_contact_method, created_at, profiles(full_name, email, mobile_number)",
@@ -65,35 +86,28 @@ Deno.serve(async (req: Request) => {
     return errorResponse("not_found", "Request not found or not accessible.", 404);
   }
 
-    const adminEmail = Deno.env.get("ADMIN_NOTIFICATION_EMAIL");
-  const resendApiKey = Deno.env.get("RESEND_API_KEY");
-  if (adminEmail && resendApiKey) {
+  const adminEmail = Deno.env.get("ADMIN_NOTIFICATION_EMAIL");
+  if (adminEmail) {
     try {
-      await fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${resendApiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          from: "M. R. Services Website <onboarding@resend.dev>",
-          to: [adminEmail],
-          subject: `New request ${request.request_number} from ${request.profiles.full_name}`,
-          html: `
-            <p><strong>Request:</strong> ${request.request_number}</p>
-            <p><strong>Client:</strong> ${request.profiles.full_name} (${request.profiles.email})</p>
-            <p><strong>Mobile:</strong> ${request.profiles.mobile_number ?? "-"}</p>
-            <p><strong>Service:</strong> ${request.service_category}</p>
-            <p><strong>Preferred contact:</strong> ${request.preferred_contact_method}</p>
-            <p><strong>Description:</strong><br/>${request.description}</p>
-          `,
-        }),
-      });
+      await sendEmail(
+        adminEmail,
+        `New request ${request.request_number} from ${request.profiles.full_name}`,
+        `
+          <p><strong>Request:</strong> ${request.request_number}</p>
+          <p><strong>Client:</strong> ${request.profiles.full_name} (${request.profiles.email})</p>
+          <p><strong>Mobile:</strong> ${request.profiles.mobile_number ?? "-"}</p>
+          <p><strong>Service:</strong> ${request.service_category}</p>
+          <p><strong>Preferred contact:</strong> ${request.preferred_contact_method}</p>
+          <p><strong>Description:</strong><br/>${request.description}</p>
+        `,
+      );
     } catch (emailError) {
-      console.error("Resend notification failed (request was still created)", emailError);
+      console.error("Brevo notification failed (request was still created)", emailError);
     }
   }
 
   return jsonResponse({ success: true });
 });
+
+
 

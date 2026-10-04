@@ -1,7 +1,9 @@
 // supabase/functions/notify-document-uploaded/index.ts
 //
-// Emails a client, if their notification_preference allows it, when admin uploads a
-// document to their account. WhatsApp is not sent automatically.
+// Notifies a client, per their notification_preference, when admin
+// uploads a new document to their account (api-spec.md 4.4, 3.4).
+// Same WhatsApp limitation as notify-new-message applies here.
+// Email sending now uses Brevo instead of Resend.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -10,10 +12,6 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
-
-// The optional secret FROM_EMAIL changes the sender address without editing code.
-const FROM_ADDRESS =
-  Deno.env.get("FROM_EMAIL") ?? "M. R. Services Website <onboarding@resend.dev>";
 
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -26,12 +24,26 @@ function errorResponse(code: string, message: string, status: number) {
   return jsonResponse({ error: { code, message } }, status);
 }
 
-function escapeHtml(text: string) {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+async function sendEmail(to: string, subject: string, html: string) {
+  const apiKey = Deno.env.get("BREVO_API_KEY");
+  const senderEmail = Deno.env.get("BREVO_SENDER_EMAIL");
+  const senderName = Deno.env.get("BREVO_SENDER_NAME") ?? "M. R. Services Website";
+  if (!apiKey || !senderEmail) return;
+
+  await fetch("https://api.brevo.com/v3/smtp/email", {
+    method: "POST",
+    headers: {
+      "api-key": apiKey,
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+    },
+    body: JSON.stringify({
+      sender: { name: senderName, email: senderEmail },
+      to: [{ email: to }],
+      subject,
+      htmlContent: html,
+    }),
+  });
 }
 
 Deno.serve(async (req: Request) => {
@@ -63,65 +75,46 @@ Deno.serve(async (req: Request) => {
     { global: { headers: { Authorization: authHeader } } },
   );
 
-  // "profiles!client_id" says which of the two links to profiles to follow (the client's).
   const { data: document, error: documentError } = await supabaseScoped
     .from("documents")
-    .select("id, title, category, client_id, profiles!client_id(full_name, email, notification_preference)")
+    .select("id, title, category, client_id, profiles(full_name, email, notification_preference)")
     .eq("id", payload.documentId)
     .single();
 
   if (documentError || !document) {
-    console.error("Could not load the document:", documentError);
     return errorResponse("not_found", "Document not found or not accessible.", 404);
   }
 
-  const resendApiKey = Deno.env.get("RESEND_API_KEY");
-  if (!resendApiKey) {
-    console.error("The RESEND_API_KEY secret is not set. No email was sent.");
-    return jsonResponse({ success: true });
-  }
-
-  const client = document.profiles;
-  const preference = client.notification_preference as "email" | "whatsapp" | "both";
+  const preference = document.profiles.notification_preference as "email" | "whatsapp" | "both";
   const wantsEmail = preference === "email" || preference === "both";
   const wantsWhatsapp = preference === "whatsapp" || preference === "both";
 
   if (wantsEmail) {
     try {
-      const response = await fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${resendApiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          from: FROM_ADDRESS,
-          to: [client.email],
-          subject: "A new document is available in your Client Portal",
-          html: `
-            <p>Hi ${escapeHtml(client.full_name)},</p>
-            <p>A new document, "<strong>${escapeHtml(document.title)}</strong>"
-               (${escapeHtml(String(document.category).replace(/_/g, " "))}), has been added to your account.
-               Sign in to the Client Portal to view or download it.</p>
-          `,
-        }),
-      });
-      if (response.ok) {
-        console.log(`Email sent to ${client.email}`);
-      } else {
-        console.error("Resend rejected the email:", response.status, await response.text());
-      }
+      await sendEmail(
+        document.profiles.email,
+        "A new document is available in your Client Portal",
+        `
+          <p>Hi ${document.profiles.full_name},</p>
+          <p>A new document, "<strong>${document.title}</strong>" (${document.category}),
+             has been added to your account. Sign in to the Client Portal to view or download it.</p>
+        `,
+      );
     } catch (emailError) {
-      console.error("Sending the email failed (the document was still saved):", emailError);
+      console.error("Brevo notification failed (document was still saved)", emailError);
     }
   }
 
   if (wantsWhatsapp) {
     console.log(
-      `Client ${document.client_id} prefers WhatsApp, but this project cannot send WhatsApp messages automatically.`,
+      `notification_preference includes WhatsApp for client ${document.client_id}, ` +
+        `but no WhatsApp send capability exists in this stack (tech-stack.md 5). ` +
+        `No automated WhatsApp message was sent.`,
     );
   }
 
   return jsonResponse({ success: true });
 });
+
+
 
