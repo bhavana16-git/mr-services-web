@@ -252,19 +252,14 @@ export function useUploadDocument() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async (input: {
-      clientId: string;
-      requestId: string | null;
-      title: string;
-      category: DocumentCategory;
-      file: File;
-      uploadedBy: string;
+      clientId: string; requestId: string | null; title: string; category: DocumentCategory;
+      file: File; uploadedBy: string;
     }) => {
       const filePath = `${input.clientId}/${crypto.randomUUID()}-${safeFileName(input.file.name)}`;
-
       const { error: uploadError } = await supabase.storage.from("documents").upload(filePath, input.file);
       if (uploadError) throw uploadError;
 
-      const { data: doc, error: insertError } = await supabase
+      const { data, error } = await supabase
         .from("documents")
         .insert({
           client_id: input.clientId,
@@ -275,23 +270,17 @@ export function useUploadDocument() {
           file_size_bytes: input.file.size,
           uploaded_by: input.uploadedBy,
         })
-        .select("id")
+        .select()
         .single();
+      if (error) throw error;
 
-      if (insertError) {
-        await supabase.storage.from("documents").remove([filePath]); // do not leave an orphan file
-        throw insertError;
-      }
-
-      // The email is a bonus: if it fails, the document is still saved.
-      const { error: notifyError } = await supabase.functions.invoke("notify-document-uploaded", {
-        body: { documentId: doc.id },
-      });
-      if (notifyError) console.warn("Email notification failed:", notifyError);
+      await supabase.functions.invoke("notify-document-uploaded", { body: { documentId: data.id } });
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["admin-documents"] }),
   });
 }
+
+
 
 export function useDeleteDocument() {
   const queryClient = useQueryClient();
@@ -325,17 +314,13 @@ export function useAdminReply() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async ({ clientId, adminId, body }: { clientId: string; adminId: string; body: string }) => {
-      const { data: message, error } = await supabase
+      const { data, error } = await supabase
         .from("messages")
         .insert({ client_id: clientId, sender_id: adminId, sender_role: "admin", body })
-        .select("id")
+        .select()
         .single();
       if (error) throw error;
-
-      const { error: notifyError } = await supabase.functions.invoke("notify-new-message", {
-        body: { messageId: message.id },
-      });
-      if (notifyError) console.warn("Email notification failed:", notifyError);
+      await supabase.functions.invoke("notify-new-message", { body: { messageId: data.id } });
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["admin-messages"] }),
   });

@@ -25,7 +25,7 @@ export function useSendMessage() {
   return useMutation({
     mutationFn: async (body: string) => {
       if (!session) throw new Error("You must be signed in.");
-      const { data: message, error } = await supabase
+      const { data, error } = await supabase
         .from("messages")
         .insert({
           client_id: session.user.id,
@@ -33,17 +33,16 @@ export function useSendMessage() {
           sender_role: "client",
           body,
         })
-        .select("id")
+        .select()
         .single();
       if (error) throw error;
 
-      // Email Manali. If the email fails the message is still saved.
-      const { error: notifyError } = await supabase.functions.invoke("notify-new-message", {
-        body: { messageId: message.id },
-      });
-      if (notifyError) console.warn("Email notification failed:", notifyError);
+      // Tell Manali by email. A failed email must never stop the message sending.
+      await supabase.functions.invoke("notify-new-message", { body: { messageId: data.id } });
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["my-messages"] }),
   });
 }
+
+
 

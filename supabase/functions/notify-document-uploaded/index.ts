@@ -3,9 +3,10 @@
 // Notifies a client, per their notification_preference, when admin
 // uploads a new document to their account (api-spec.md 4.4, 3.4).
 // Same WhatsApp limitation as notify-new-message applies here.
-// Email sending now uses Brevo instead of Resend.
+// Email is sent through Brevo (see _shared/brevo.ts).
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { escapeHtml, sendBrevoEmail } from "../_shared/brevo.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": Deno.env.get("SITE_URL") ?? "*",
@@ -22,28 +23,6 @@ function jsonResponse(body: unknown, status = 200) {
 
 function errorResponse(code: string, message: string, status: number) {
   return jsonResponse({ error: { code, message } }, status);
-}
-
-async function sendEmail(to: string, subject: string, html: string) {
-  const apiKey = Deno.env.get("BREVO_API_KEY");
-  const senderEmail = Deno.env.get("BREVO_SENDER_EMAIL");
-  const senderName = Deno.env.get("BREVO_SENDER_NAME") ?? "M. R. Services Website";
-  if (!apiKey || !senderEmail) return;
-
-  await fetch("https://api.brevo.com/v3/smtp/email", {
-    method: "POST",
-    headers: {
-      "api-key": apiKey,
-      "Content-Type": "application/json",
-      "Accept": "application/json",
-    },
-    body: JSON.stringify({
-      sender: { name: senderName, email: senderEmail },
-      to: [{ email: to }],
-      subject,
-      htmlContent: html,
-    }),
-  });
 }
 
 Deno.serve(async (req: Request) => {
@@ -69,6 +48,11 @@ Deno.serve(async (req: Request) => {
     return errorResponse("validation_error", "documentId is required.", 422);
   }
 
+  // Scoped to the caller's JWT. In practice this is always admin (only
+  // documents_admin_all permits the insert this function follows), and
+  // documents_admin_all also permits this select -- a client calling this
+  // directly would get zero rows back and a clean 404, never another
+  // client's document.
   const supabaseScoped = createClient(
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_ANON_KEY")!,
@@ -77,7 +61,7 @@ Deno.serve(async (req: Request) => {
 
   const { data: document, error: documentError } = await supabaseScoped
     .from("documents")
-    .select("id, title, category, client_id, profiles(full_name, email, notification_preference)")
+    .select("id, title, category, client_id, profiles!documents_client_id_fkey(full_name, email, notification_preference)")
     .eq("id", payload.documentId)
     .single();
 
@@ -90,19 +74,15 @@ Deno.serve(async (req: Request) => {
   const wantsWhatsapp = preference === "whatsapp" || preference === "both";
 
   if (wantsEmail) {
-    try {
-      await sendEmail(
-        document.profiles.email,
-        "A new document is available in your Client Portal",
-        `
-          <p>Hi ${document.profiles.full_name},</p>
-          <p>A new document, "<strong>${document.title}</strong>" (${document.category}),
-             has been added to your account. Sign in to the Client Portal to view or download it.</p>
-        `,
-      );
-    } catch (emailError) {
-      console.error("Brevo notification failed (document was still saved)", emailError);
-    }
+    await sendBrevoEmail({
+      to: document.profiles.email,
+      subject: "A new document is available in your Client Portal",
+      html: `
+        <p>Hi ${escapeHtml(document.profiles.full_name)},</p>
+        <p>A new document, "<strong>${escapeHtml(document.title)}</strong>" (${escapeHtml(document.category)}),
+           has been added to your account. Sign in to the Client Portal to view or download it.</p>
+      `,
+    });
   }
 
   if (wantsWhatsapp) {

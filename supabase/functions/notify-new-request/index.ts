@@ -2,9 +2,10 @@
 //
 // Emails Manali when a client submits a new request (api-spec.md 4.2).
 // Called by the frontend immediately after a successful `requests` insert.
-// Email sending now uses Brevo instead of Resend.
+// Email is sent through Brevo (see _shared/brevo.ts).
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { escapeHtml, sendBrevoEmail } from "../_shared/brevo.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": Deno.env.get("SITE_URL") ?? "*",
@@ -21,28 +22,6 @@ function jsonResponse(body: unknown, status = 200) {
 
 function errorResponse(code: string, message: string, status: number) {
   return jsonResponse({ error: { code, message } }, status);
-}
-
-async function sendEmail(to: string, subject: string, html: string) {
-  const apiKey = Deno.env.get("BREVO_API_KEY");
-  const senderEmail = Deno.env.get("BREVO_SENDER_EMAIL");
-  const senderName = Deno.env.get("BREVO_SENDER_NAME") ?? "M. R. Services Website";
-  if (!apiKey || !senderEmail) return;
-
-  await fetch("https://api.brevo.com/v3/smtp/email", {
-    method: "POST",
-    headers: {
-      "api-key": apiKey,
-      "Content-Type": "application/json",
-      "Accept": "application/json",
-    },
-    body: JSON.stringify({
-      sender: { name: senderName, email: senderEmail },
-      to: [{ email: to }],
-      subject,
-      htmlContent: html,
-    }),
-  });
 }
 
 Deno.serve(async (req: Request) => {
@@ -68,6 +47,9 @@ Deno.serve(async (req: Request) => {
     return errorResponse("validation_error", "requestId is required.", 422);
   }
 
+  // A client scoped to the CALLER's own JWT, not the service role. Row
+  // Level Security (requests_select_own / requests_select_admin) decides
+  // whether this caller may even see the request.
   const supabaseScoped = createClient(
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_ANON_KEY")!,
@@ -88,26 +70,24 @@ Deno.serve(async (req: Request) => {
 
   const adminEmail = Deno.env.get("ADMIN_NOTIFICATION_EMAIL");
   if (adminEmail) {
-    try {
-      await sendEmail(
-        adminEmail,
-        `New request ${request.request_number} from ${request.profiles.full_name}`,
-        `
-          <p><strong>Request:</strong> ${request.request_number}</p>
-          <p><strong>Client:</strong> ${request.profiles.full_name} (${request.profiles.email})</p>
-          <p><strong>Mobile:</strong> ${request.profiles.mobile_number ?? "-"}</p>
-          <p><strong>Service:</strong> ${request.service_category}</p>
-          <p><strong>Preferred contact:</strong> ${request.preferred_contact_method}</p>
-          <p><strong>Description:</strong><br/>${request.description}</p>
-        `,
-      );
-    } catch (emailError) {
-      console.error("Brevo notification failed (request was still created)", emailError);
-    }
+    await sendBrevoEmail({
+      to: adminEmail,
+      replyTo: request.profiles.email,
+      subject: `New request ${request.request_number} from ${request.profiles.full_name}`,
+      html: `
+        <p><strong>Request:</strong> ${escapeHtml(request.request_number)}</p>
+        <p><strong>Client:</strong> ${escapeHtml(request.profiles.full_name)} (${escapeHtml(request.profiles.email)})</p>
+        <p><strong>Mobile:</strong> ${escapeHtml(request.profiles.mobile_number ?? "-")}</p>
+        <p><strong>Service:</strong> ${escapeHtml(request.service_category)}</p>
+        <p><strong>Preferred contact:</strong> ${escapeHtml(request.preferred_contact_method)}</p>
+        <p><strong>Description:</strong><br/>${escapeHtml(request.description).replace(/\n/g, "<br/>")}</p>
+      `,
+    });
+  } else {
+    console.error("ADMIN_NOTIFICATION_EMAIL is not set; no notification email was sent.");
   }
 
   return jsonResponse({ success: true });
 });
-
 
 
