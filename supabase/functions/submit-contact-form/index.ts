@@ -1,10 +1,8 @@
 // supabase/functions/submit-contact-form/index.ts
 //
-// Hardened, production-recommended path for the public Contact Us form
-// (api-spec.md 4.1). Replaces a direct anon table insert: verifies a
-// Turnstile token, re-validates the payload server-side, rate-limits by
-// email, then inserts using the service-role client, which bypasses RLS.
-// Email sending now uses Brevo instead of Resend.
+// Public Contact Us form (api-spec.md 4.1). Verifies a Turnstile token,
+// re-validates the payload server-side, rate-limits by email, inserts with
+// the service-role client (bypasses RLS), then emails Manali through Brevo.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -25,27 +23,68 @@ function errorResponse(code: string, message: string, status: number, fields?: R
   return jsonResponse({ error: { code, message, ...(fields ? { fields } : {}) } }, status);
 }
 
-async function sendEmail(to: string, subject: string, html: string) {
+// ---------------------------------------------------------------------------
+// Brevo email helpers
+// ---------------------------------------------------------------------------
+
+// Stops visitor-typed text (like "<script>") from becoming real HTML in the email.
+function escapeHtml(value: unknown): string {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+interface BrevoEmail {
+  to: string;
+  toName?: string;
+  subject: string;
+  html: string;
+  replyTo?: { email: string; name?: string };
+}
+
+// Sends one email through Brevo's transactional API. Returns true on success.
+// An HTTP failure is logged (visible in the Supabase function logs) and
+// returns false, so a failed email can never break the main request.
+async function sendBrevoEmail(email: BrevoEmail): Promise<boolean> {
   const apiKey = Deno.env.get("BREVO_API_KEY");
   const senderEmail = Deno.env.get("BREVO_SENDER_EMAIL");
-  const senderName = Deno.env.get("BREVO_SENDER_NAME") ?? "M. R. Services Website";
-  if (!apiKey || !senderEmail) return;
+  const senderName = Deno.env.get("BREVO_SENDER_NAME") ?? "M. R. Services";
 
-  await fetch("https://api.brevo.com/v3/smtp/email", {
+  if (!apiKey || !senderEmail) {
+    console.error("Brevo is not configured: BREVO_API_KEY or BREVO_SENDER_EMAIL secret is missing.");
+    return false;
+  }
+
+  const response = await fetch("https://api.brevo.com/v3/smtp/email", {
     method: "POST",
     headers: {
       "api-key": apiKey,
       "Content-Type": "application/json",
-      "Accept": "application/json",
+      Accept: "application/json",
     },
     body: JSON.stringify({
       sender: { name: senderName, email: senderEmail },
-      to: [{ email: to }],
-      subject,
-      htmlContent: html,
+      to: [{ email: email.to, ...(email.toName ? { name: email.toName } : {}) }],
+      subject: email.subject.replace(/[\r\n]+/g, " "),
+      htmlContent: email.html,
+      ...(email.replyTo ? { replyTo: email.replyTo } : {}),
     }),
   });
+
+  if (!response.ok) {
+    const details = await response.text();
+    console.error(`Brevo rejected the email (HTTP ${response.status}): ${details}`);
+    return false;
+  }
+  return true;
 }
+
+// ---------------------------------------------------------------------------
+// Validation + Turnstile
+// ---------------------------------------------------------------------------
 
 const SERVICE_CATEGORIES = ["society_accounting", "business_accounting", "typing_services", "other"];
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -103,6 +142,10 @@ async function verifyTurnstile(token: string, remoteIp: string | null): Promise<
   return result.success === true;
 }
 
+// ---------------------------------------------------------------------------
+// Handler
+// ---------------------------------------------------------------------------
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
@@ -118,11 +161,13 @@ Deno.serve(async (req: Request) => {
     return errorResponse("invalid_json", "Request body must be valid JSON.", 400);
   }
 
+  // Step 2: validate/sanitize fields server-side (mirrors the frontend Zod schema).
   const fieldErrors = validate(payload);
   if (Object.keys(fieldErrors).length > 0) {
     return errorResponse("validation_error", "Please check the highlighted fields.", 422, fieldErrors);
   }
 
+  // Step 1: verify the Turnstile token before doing anything else.
   const remoteIp = req.headers.get("x-forwarded-for");
   const humanVerified = await verifyTurnstile(payload.turnstileToken as string, remoteIp);
   if (!humanVerified) {
@@ -134,6 +179,7 @@ Deno.serve(async (req: Request) => {
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
   );
 
+  // Step 3: rate-limit by email (max 3 submissions per 5 minutes).
   const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
   const { count: recentCount } = await supabaseAdmin
     .from("contact_submissions")
@@ -145,6 +191,7 @@ Deno.serve(async (req: Request) => {
     return errorResponse("rate_limited", "Too many submissions. Please try again in a few minutes.", 429);
   }
 
+  // Step 4: insert using the service-role client.
   const { data: inserted, error: insertError } = await supabaseAdmin
     .from("contact_submissions")
     .insert({
@@ -162,27 +209,30 @@ Deno.serve(async (req: Request) => {
     return errorResponse("insert_failed", "Something went wrong. Please try again.", 500);
   }
 
-  // Notify Manali via Brevo. A failed email must never fail the whole
-  // request -- the submission is already safely stored.
+  // Step 5: notify Manali through Brevo. A failed email must never fail the
+  // whole request, because the submission is already safely stored.
   const adminEmail = Deno.env.get("ADMIN_NOTIFICATION_EMAIL");
   if (adminEmail) {
     try {
-      await sendEmail(
-        adminEmail,
-        `New contact form submission from ${payload.name}`,
-        `
-          <p><strong>Name:</strong> ${payload.name}</p>
-          <p><strong>Phone:</strong> ${payload.phone}</p>
-          <p><strong>Email:</strong> ${payload.email}</p>
-          <p><strong>Service:</strong> ${payload.service_interested_in}</p>
-          <p><strong>Message:</strong><br/>${payload.message}</p>
+      await sendBrevoEmail({
+        to: adminEmail,
+        subject: `New contact form submission from ${payload.name}`,
+        html: `
+          <p><strong>Name:</strong> ${escapeHtml(payload.name)}</p>
+          <p><strong>Phone:</strong> ${escapeHtml(payload.phone)}</p>
+          <p><strong>Email:</strong> ${escapeHtml(payload.email)}</p>
+          <p><strong>Service:</strong> ${escapeHtml(payload.service_interested_in)}</p>
+          <p><strong>Message:</strong><br/>${escapeHtml(payload.message).replace(/\n/g, "<br/>")}</p>
         `,
-      );
+        // Pressing "Reply" in Gmail answers the visitor directly.
+        replyTo: { email: payload.email as string, name: payload.name as string },
+      });
     } catch (emailError) {
       console.error("Brevo notification failed (submission was still saved)", emailError);
     }
   }
 
+  // Step 6
   return jsonResponse({ success: true, id: inserted.id });
 });
 

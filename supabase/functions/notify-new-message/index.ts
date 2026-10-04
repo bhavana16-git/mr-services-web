@@ -1,17 +1,14 @@
 // supabase/functions/notify-new-message/index.ts
 //
 // Notifies the *other* side of a conversation when a new message arrives
-// (api-spec.md 4.3). If a client sent the message, Manali is always
-// emailed (mirrors notify-new-request). If admin sent it, the client is
-// notified according to their own `notification_preference`.
-// Email sending now uses Brevo instead of Resend.
+// (api-spec.md 4.3), sending the email through Brevo. If a client sent the
+// message, Manali is always emailed. If admin sent it, the client is emailed
+// according to their own `notification_preference`.
 //
-// WhatsApp note: tech-stack.md 5 scopes WhatsApp integration to a
-// click-to-chat `wa.me` link only -- there is no WhatsApp Business API in
-// this stack, so this function cannot actually *send* a WhatsApp message.
-// Where a client's preference is 'whatsapp' or 'both', the email half (if
-// applicable) still goes out, and the WhatsApp half is a deliberate no-op,
-// documented inline below rather than silently pretending to send one.
+// WhatsApp note: tech-stack.md 5 scopes WhatsApp to a click-to-chat wa.me
+// link only, so this function cannot send a WhatsApp message. Where a client's
+// preference is 'whatsapp' or 'both', the email half still goes out and the
+// WhatsApp half is a deliberate no-op that is logged below.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -32,27 +29,68 @@ function errorResponse(code: string, message: string, status: number) {
   return jsonResponse({ error: { code, message } }, status);
 }
 
-async function sendEmail(to: string, subject: string, html: string) {
+// ---------------------------------------------------------------------------
+// Brevo email helpers
+// ---------------------------------------------------------------------------
+
+// Stops user-typed text (like "<script>") from becoming real HTML in the email.
+function escapeHtml(value: unknown): string {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+interface BrevoEmail {
+  to: string;
+  toName?: string;
+  subject: string;
+  html: string;
+  replyTo?: { email: string; name?: string };
+}
+
+// Sends one email through Brevo's transactional API. Returns true on success.
+// An HTTP failure is logged (visible in the Supabase function logs) and
+// returns false, so a failed email can never break the main request.
+async function sendBrevoEmail(email: BrevoEmail): Promise<boolean> {
   const apiKey = Deno.env.get("BREVO_API_KEY");
   const senderEmail = Deno.env.get("BREVO_SENDER_EMAIL");
-  const senderName = Deno.env.get("BREVO_SENDER_NAME") ?? "M. R. Services Website";
-  if (!apiKey || !senderEmail) return;
+  const senderName = Deno.env.get("BREVO_SENDER_NAME") ?? "M. R. Services";
 
-  await fetch("https://api.brevo.com/v3/smtp/email", {
+  if (!apiKey || !senderEmail) {
+    console.error("Brevo is not configured: BREVO_API_KEY or BREVO_SENDER_EMAIL secret is missing.");
+    return false;
+  }
+
+  const response = await fetch("https://api.brevo.com/v3/smtp/email", {
     method: "POST",
     headers: {
       "api-key": apiKey,
       "Content-Type": "application/json",
-      "Accept": "application/json",
+      Accept: "application/json",
     },
     body: JSON.stringify({
       sender: { name: senderName, email: senderEmail },
-      to: [{ email: to }],
-      subject,
-      htmlContent: html,
+      to: [{ email: email.to, ...(email.toName ? { name: email.toName } : {}) }],
+      subject: email.subject.replace(/[\r\n]+/g, " "),
+      htmlContent: email.html,
+      ...(email.replyTo ? { replyTo: email.replyTo } : {}),
     }),
   });
+
+  if (!response.ok) {
+    const details = await response.text();
+    console.error(`Brevo rejected the email (HTTP ${response.status}): ${details}`);
+    return false;
+  }
+  return true;
 }
+
+// ---------------------------------------------------------------------------
+// Handler
+// ---------------------------------------------------------------------------
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
@@ -77,6 +115,8 @@ Deno.serve(async (req: Request) => {
     return errorResponse("validation_error", "messageId is required.", 422);
   }
 
+  // Scoped to the caller's JWT: Row Level Security decides whether this
+  // caller may see the message at all.
   const supabaseScoped = createClient(
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_ANON_KEY")!,
@@ -99,12 +139,16 @@ Deno.serve(async (req: Request) => {
     // Client -> admin: Manali is always emailed about a new client message.
     if (adminEmail) {
       try {
-        await sendEmail(
-          adminEmail,
-          `New message from ${message.profiles.full_name}`,
-          `<p><strong>From:</strong> ${message.profiles.full_name} (${message.profiles.email})</p>
-           <p><strong>Message:</strong><br/>${message.body}</p>`,
-        );
+        await sendBrevoEmail({
+          to: adminEmail,
+          subject: `New message from ${message.profiles.full_name}`,
+          html: `
+            <p><strong>From:</strong> ${escapeHtml(message.profiles.full_name)} (${escapeHtml(message.profiles.email)})</p>
+            <p><strong>Message:</strong><br/>${escapeHtml(message.body).replace(/\n/g, "<br/>")}</p>
+          `,
+          // Pressing "Reply" in Gmail answers the client directly.
+          replyTo: { email: message.profiles.email, name: message.profiles.full_name },
+        });
       } catch (emailError) {
         console.error("Brevo notification to admin failed", emailError);
       }
@@ -117,18 +161,23 @@ Deno.serve(async (req: Request) => {
 
     if (wantsEmail) {
       try {
-        await sendEmail(
-          message.profiles.email,
-          "You have a new message from M. R. Services",
-          `<p>Hi ${message.profiles.full_name},</p>
-           <p>You have a new message from M. R. Services. Sign in to the Client Portal to read and reply.</p>`,
-        );
+        await sendBrevoEmail({
+          to: message.profiles.email,
+          toName: message.profiles.full_name,
+          subject: "You have a new message from M. R. Services",
+          html: `
+            <p>Hi ${escapeHtml(message.profiles.full_name)},</p>
+            <p>You have a new message from M. R. Services. Sign in to the Client Portal to read and reply.</p>
+          `,
+        });
       } catch (emailError) {
         console.error("Brevo notification to client failed", emailError);
       }
     }
 
     if (wantsWhatsapp) {
+      // Deliberate no-op: see the file header. Logged so this gap is visible
+      // in the Edge Function's own logs rather than silent.
       console.log(
         `notification_preference includes WhatsApp for client ${message.client_id}, ` +
           `but no WhatsApp send capability exists in this stack (tech-stack.md 5). ` +
@@ -139,5 +188,7 @@ Deno.serve(async (req: Request) => {
 
   return jsonResponse({ success: true });
 });
+
+
 
 
