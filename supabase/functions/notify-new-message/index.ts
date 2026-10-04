@@ -4,7 +4,7 @@
 // (api-spec.md 4.3). If a client sent the message, Manali is always
 // emailed (mirrors notify-new-request). If admin sent it, the client is
 // notified according to their own `notification_preference`.
-// Email sending now uses Brevo instead of Resend.
+// Email is sent through Brevo (see _shared/brevo.ts).
 //
 // WhatsApp note: tech-stack.md 5 scopes WhatsApp integration to a
 // click-to-chat `wa.me` link only -- there is no WhatsApp Business API in
@@ -14,6 +14,7 @@
 // documented inline below rather than silently pretending to send one.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { escapeHtml, sendBrevoEmail } from "../_shared/brevo.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": Deno.env.get("SITE_URL") ?? "*",
@@ -30,28 +31,6 @@ function jsonResponse(body: unknown, status = 200) {
 
 function errorResponse(code: string, message: string, status: number) {
   return jsonResponse({ error: { code, message } }, status);
-}
-
-async function sendEmail(to: string, subject: string, html: string) {
-  const apiKey = Deno.env.get("BREVO_API_KEY");
-  const senderEmail = Deno.env.get("BREVO_SENDER_EMAIL");
-  const senderName = Deno.env.get("BREVO_SENDER_NAME") ?? "M. R. Services Website";
-  if (!apiKey || !senderEmail) return;
-
-  await fetch("https://api.brevo.com/v3/smtp/email", {
-    method: "POST",
-    headers: {
-      "api-key": apiKey,
-      "Content-Type": "application/json",
-      "Accept": "application/json",
-    },
-    body: JSON.stringify({
-      sender: { name: senderName, email: senderEmail },
-      to: [{ email: to }],
-      subject,
-      htmlContent: html,
-    }),
-  });
 }
 
 Deno.serve(async (req: Request) => {
@@ -77,6 +56,8 @@ Deno.serve(async (req: Request) => {
     return errorResponse("validation_error", "messageId is required.", 422);
   }
 
+  // Scoped to the caller's JWT -- messages_select_own / messages_select_admin
+  // decide whether this caller may see the message at all.
   const supabaseScoped = createClient(
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_ANON_KEY")!,
@@ -85,7 +66,7 @@ Deno.serve(async (req: Request) => {
 
   const { data: message, error: messageError } = await supabaseScoped
     .from("messages")
-    .select("id, client_id, sender_role, body, profiles(full_name, email, notification_preference)")
+    .select("id, client_id, sender_role, body, profiles!messages_client_id_fkey(full_name, email, notification_preference)")
     .eq("id", payload.messageId)
     .single();
 
@@ -98,16 +79,15 @@ Deno.serve(async (req: Request) => {
   if (message.sender_role === "client") {
     // Client -> admin: Manali is always emailed about a new client message.
     if (adminEmail) {
-      try {
-        await sendEmail(
-          adminEmail,
-          `New message from ${message.profiles.full_name}`,
-          `<p><strong>From:</strong> ${message.profiles.full_name} (${message.profiles.email})</p>
-           <p><strong>Message:</strong><br/>${message.body}</p>`,
-        );
-      } catch (emailError) {
-        console.error("Brevo notification to admin failed", emailError);
-      }
+      await sendBrevoEmail({
+        to: adminEmail,
+        replyTo: message.profiles.email,
+        subject: `New message from ${message.profiles.full_name}`,
+        html: `<p><strong>From:</strong> ${escapeHtml(message.profiles.full_name)} (${escapeHtml(message.profiles.email)})</p>
+           <p><strong>Message:</strong><br/>${escapeHtml(message.body).replace(/\n/g, "<br/>")}</p>`,
+      });
+    } else {
+      console.error("ADMIN_NOTIFICATION_EMAIL is not set; no notification email was sent.");
     }
   } else {
     // Admin -> client: respect the client's notification_preference.
@@ -116,19 +96,17 @@ Deno.serve(async (req: Request) => {
     const wantsWhatsapp = preference === "whatsapp" || preference === "both";
 
     if (wantsEmail) {
-      try {
-        await sendEmail(
-          message.profiles.email,
-          "You have a new message from M. R. Services",
-          `<p>Hi ${message.profiles.full_name},</p>
+      await sendBrevoEmail({
+        to: message.profiles.email,
+        subject: "You have a new message from M. R. Services",
+        html: `<p>Hi ${escapeHtml(message.profiles.full_name)},</p>
            <p>You have a new message from M. R. Services. Sign in to the Client Portal to read and reply.</p>`,
-        );
-      } catch (emailError) {
-        console.error("Brevo notification to client failed", emailError);
-      }
+      });
     }
 
     if (wantsWhatsapp) {
+      // Deliberate no-op: see the file header. Logged so this gap is
+      // visible in the Edge Function's own logs rather than silent.
       console.log(
         `notification_preference includes WhatsApp for client ${message.client_id}, ` +
           `but no WhatsApp send capability exists in this stack (tech-stack.md 5). ` +
@@ -139,5 +117,9 @@ Deno.serve(async (req: Request) => {
 
   return jsonResponse({ success: true });
 });
+
+
+
+
 
 
